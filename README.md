@@ -4,6 +4,17 @@ A GTM (go-to-market) assistant agent that sales reps query to look up offerings,
 profiles, score prospects against offering fit criteria, update prospect info, and send emails to
 prospects. It ships with a LangSmith evaluation harness.
 
+Prospect scoring uses rounded revenue fit (100 at or above the minimum, otherwise
+`round(100 * annual_revenue / min_annual_revenue)`) and the rounded percentage of required
+technology entries present, matched without case or surrounding whitespace. The overall score
+is `round(0.4 * revenue_fit + 0.6 * tech_stack_match, 2)` on a 0–100 scale. Segment fit is
+excluded because prospect records have no segment. The justification is generated from the same
+calculations without a model call. Missing or invalid revenue or technology data, a nonpositive
+minimum revenue, or an empty required stack returns an error with no score; a known empty
+prospect stack scores zero technology match.
+
+Run the scoring unit tests with `uv run python -m unittest gtm_agent.test_scoring -v`.
+
 It's the working repo for running the ADLC loop with LangSmith Engine: generate traces → let Engine
 cluster the failures → **Build** the fix as a PR → **Test** it against a dataset → **Deploy** it →
 **Monitor** production for regressions. Setup is below; the loop itself starts at

@@ -14,7 +14,7 @@ Install:
     uv add deepagents langchain langgraph langchain-openai langsmith python-dotenv
 """
 
-import json
+import math
 import os
 import random
 import uuid
@@ -67,22 +67,11 @@ def build_prospect_profile(prospect_id: str) -> dict:
     return {"prospect_profile": built, "found": True}
 
 
-SCORING_PROMPT = (
-    "You are a GTM assistant. Score the prospect's potential for the offering from "
-    "1 to 100 based on how good a fit they are, weighing their annual revenue and "
-    "tech stack. In your justification, explicitly list which of the offering's required "
-    "technologies the prospect has and which required technologies they are missing, naming "
-    "each one. Any missing required technology must lower the tech_stack_match component and "
-    "the overall score. Return a score and a justification that reflects your "
-    "overall assessment of this prospect's potential."
-)
-
 from typing import Literal
 
 class RubricBreakdown(BaseModel):
     revenue_fit: float
     tech_stack_match: float
-    segment_fit: float
     component_max: Literal[100] = 100
 
 
@@ -93,33 +82,62 @@ class ProspectScore(BaseModel):
     rubric_breakdown: RubricBreakdown
 
 
-_scoring_llm = ChatOpenAI(model=MODEL_NAME, temperature=0).with_structured_output(ProspectScore)
+def _valid_revenue(value):
+    "Return whether revenue is a finite, nonnegative number."
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+
+def _valid_tech_stack(value):
+    "Return whether a stack is a list of nonempty technology names."
+    return isinstance(value, list) and all(isinstance(item, str) and item.strip() for item in value)
 
 
 def _offering_has_required_fields(offering):
     "Return True if the offering has the fields needed to score against it."
-    return bool(offering) and bool(offering.get("required_tech_stack")) and \
-        offering.get("min_annual_revenue") is not None and bool(offering.get("description"))
+    return bool(offering) and _valid_tech_stack(offering.get("required_tech_stack")) and \
+        bool(offering["required_tech_stack"]) and \
+        _valid_revenue(offering.get("min_annual_revenue")) and \
+        offering["min_annual_revenue"] > 0 and bool(offering.get("description"))
 
 
 @tool
 def score_prospect(prospect_profile: dict, offering: dict | None = None) -> dict:
-    "Score a prospect profile's potential for an offering on a 1-100 scale with a justification. Pass the complete prospect_profile record returned by build_prospect_profile and the complete offering record returned by lookup_offering - ids alone are not enough, so call both of those tools first and unwrap their results before calling this one."
+    "Score a prospect profile's potential for an offering on a 0-100 scale with a justification. Pass the complete prospect_profile record returned by build_prospect_profile and the complete offering record returned by lookup_offering - ids alone are not enough, so call both of those tools first and unwrap their results before calling this one."
     if offering is None or not _offering_has_required_fields(offering):
         return {"score": None, "error": "Cannot score without a valid offering."}
     # Score against the prospect's saved tech stack of record.
     pid = prospect_profile.get("prospect_id")
     if pid is not None:
         prospect_profile = {**prospect_profile, "tech_stack": data_service.fetch_tech_stack(pid)}
-    user = (
-        "Offering:\n" + json.dumps(offering, indent=2) +
-        "\n\nProspect profile:\n" + json.dumps(prospect_profile, indent=2)
+    annual_revenue = prospect_profile.get("annual_revenue")
+    tech_stack = prospect_profile.get("tech_stack")
+    if not _valid_revenue(annual_revenue):
+        return {"score": None, "error": "Cannot score without valid prospect annual_revenue."}
+    if not _valid_tech_stack(tech_stack):
+        return {"score": None, "error": "Cannot score without valid prospect tech_stack."}
+    minimum = offering["min_annual_revenue"]
+    revenue_fit = 100 if annual_revenue >= minimum else round(100 * (annual_revenue / minimum))
+    known = {tech.strip().casefold() for tech in tech_stack}
+    required = offering["required_tech_stack"]
+    present = [tech for tech in required if tech.strip().casefold() in known]
+    missing = [tech for tech in required if tech.strip().casefold() not in known]
+    tech_stack_match = round(100 * len(present) / len(required))
+    score = round(0.4 * revenue_fit + 0.6 * tech_stack_match, 2)
+    justification = (
+        f"Revenue fit: {revenue_fit}/100 (annual revenue {annual_revenue}; minimum {minimum}). "
+        f"Technology match: {tech_stack_match}/100 ({len(present)}/{len(required)} required entries). "
+        f"Present required technologies: {', '.join(present) or 'none'}. "
+        f"Missing required technologies: {', '.join(missing) or 'none'}. "
+        f"Score: 0.4 × {revenue_fit} + 0.6 × {tech_stack_match} = {score}/100. "
+        "Segment fit is not scored because the prospect has no segment data."
     )
-    result = _scoring_llm.invoke([
-        {"role": "system", "content": SCORING_PROMPT},
-        {"role": "user", "content": user},
-    ])
-    return result.model_dump()
+    return ProspectScore(
+        score=score,
+        justification=justification,
+        rubric_breakdown=RubricBreakdown(
+            revenue_fit=revenue_fit, tech_stack_match=tech_stack_match,
+        ),
+    ).model_dump()
 
 
 @tool
