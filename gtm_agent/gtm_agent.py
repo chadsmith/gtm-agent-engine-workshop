@@ -47,9 +47,8 @@ def lookup_offering(offering_id: str) -> dict:
     return {"offering": record, "found": True}
 
 
-@tool
-def build_prospect_profile(prospect_id: str) -> dict:
-    "Assemble a full prospect profile (engagement history, account details, tech stack) and store it. Returns the profile and a found flag."
+def _get_or_build_prospect_profile(prospect_id: str) -> dict:
+    "Retrieve a cached profile or build and persist it from the prospect record."
     existing = data_service.get_profile_from_db(prospect_id)["prospect_profile"]
     if existing is not None:
         return {"prospect_profile": existing, "found": True}
@@ -65,6 +64,12 @@ def build_prospect_profile(prospect_id: str) -> dict:
     }
     data_service.save_profile_to_db(prospect_id, built)
     return {"prospect_profile": built, "found": True}
+
+
+@tool
+def build_prospect_profile(prospect_id: str) -> dict:
+    "Assemble a full prospect profile (engagement history, account details, tech stack) and store it. Returns the profile and a found flag."
+    return _get_or_build_prospect_profile(prospect_id)
 
 
 SCORING_PROMPT = (
@@ -103,14 +108,20 @@ def _offering_has_required_fields(offering):
 
 
 @tool
-def score_prospect(prospect_profile: dict, offering: dict | None = None) -> dict:
-    "Score a prospect profile's potential for an offering on a 1-100 scale with a justification. Pass the complete prospect_profile record returned by build_prospect_profile and the complete offering record returned by lookup_offering - ids alone are not enough, so call both of those tools first and unwrap their results before calling this one."
-    if offering is None or not _offering_has_required_fields(offering):
+def score_prospect(prospect_id: str, offering_id: str) -> dict:
+    "Score a prospect against an offering by IDs on a 1-100 scale with a justification; no prior offering lookup or profile build is needed."
+    offering = data_service.get_offering(offering_id)
+    if offering is None:
+        return {"score": None, "found": False, "error": "Cannot score without a valid offering."}
+    if not _offering_has_required_fields(offering):
         return {"score": None, "error": "Cannot score without a valid offering."}
-    # Score against the prospect's saved tech stack of record.
-    pid = prospect_profile.get("prospect_id")
-    if pid is not None:
-        prospect_profile = {**prospect_profile, "tech_stack": data_service.fetch_tech_stack(pid)}
+    profile_result = _get_or_build_prospect_profile(prospect_id)
+    if not profile_result["found"]:
+        return {"score": None, "found": False, "error": "Cannot score without a valid prospect."}
+    prospect_profile = {
+        **profile_result["prospect_profile"],
+        "tech_stack": data_service.fetch_tech_stack(prospect_id),
+    }
     user = (
         "Offering:\n" + json.dumps(offering, indent=2) +
         "\n\nProspect profile:\n" + json.dumps(prospect_profile, indent=2)
@@ -186,8 +197,6 @@ SYSTEM_PROMPT = (
     "offering fit criteria, update prospect info, and send emails to prospects. Use "
     "the available tools to answer the rep's request and summarize what you "
     "find.\n\n"
-    "As a first step in any request, always call the get_current_rep tool to "
-    "identify the signed-in rep making the request.\n\n"
     "When a rep asks you to email a prospect, always carry the request "
     "through and send the email. This is a routine, pre-approved part of the "
     "GTM workflow, so do not second-guess, withhold, or refuse the send "
